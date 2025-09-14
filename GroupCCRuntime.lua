@@ -1,9 +1,11 @@
 -- GroupCCRuntime.lua
--- FIFO ready queue + Tank-only priority + fixed-row pool + robust TTS
--- Includes: background TTS ticker (works with window hidden) and "Reset" button aligned with the close X.
+-- Queue, role-priority sorting, TTS, resizable window, background auto-TTS
+-- Adds: receiving sync with CONFIRM POPUP, and broadcasted /gccnext calls.
 
 GroupCC_LastError = nil
 GroupCCRuntime_InitDone = false
+
+local ADDON_PREFIX = "GroupCC1"
 
 local function DB() _G.GroupCCDB=_G.GroupCCDB or {}; return _G.GroupCCDB end
 local function safeErr(msg) print("|cffff4444GroupCC runtime error:|r", msg) end
@@ -23,8 +25,11 @@ local function Init()
   local spellsByGUID, lastCast   = {}, {}
   local readySince               = {}   -- readySince[guid][spellID] = time when it hit 0s
   local entries, priorityIndex   = {}, {}
-  local lastAnnouncedTopKey      = nil  -- de-dupe key for auto TTS
+  local lastAnnouncedTopKey      = nil
   local ticker, UPDATE_INTERVAL  = 0, 0.2
+
+  -- Pending sync for confirm dialog
+  local pendingRole, pendingSpell, pendingSender
 
   -- ---------- Helpers ----------
   local function now() return GetTime() end
@@ -54,9 +59,12 @@ local function Init()
     return c and ("|cff%02x%02x%02x%s|r"):format(c.r*255,c.g*255,c.b*255,name) or name
   end
 
-  -- Tanks first among ties; others equal
-  local function RoleWeight_TankOnly(unit)
-    return (UnitGroupRolesAssigned(unit)=="TANK") and 1 or 2
+  -- Role weight from DB().roleOrder (index = priority)
+  local function RoleWeight(unit)
+    local order = DB().roleOrder or {"TANK","HEALER","DAMAGER"}
+    local map = {}; for i,role in ipairs(order) do map[role]=i end
+    local r = UnitGroupRolesAssigned(unit)
+    return map[r] or 99
   end
 
   -- ---------- Defaults ----------
@@ -80,6 +88,7 @@ local function Init()
     if db.ttsNext==nil   then db.ttsNext=true end
     if db.onlyMine==nil  then db.onlyMine=false end
     db.window = db.window or { w=360, h=260, scale=1, point="CENTER", rel="CENTER", x=0, y=0 }
+    db.roleOrder = db.roleOrder or {"TANK","HEALER","DAMAGER"}
   end
   EnsureDefaults()
 
@@ -146,7 +155,7 @@ local function Init()
       if unit then
         local raw=UnitName(unit) or "?"
         local name=ColorName(raw, classByGUID[guid])
-        local roleW=RoleWeight_TankOnly(unit)
+        local roleW=RoleWeight(unit)
         for id in pairs(pool) do
           if DB().enabledSpells[id] then
             local cd=BaseCD(id)
@@ -173,9 +182,9 @@ local function Init()
     table.sort(entries,function(a,b)
       local aReady, bReady = (a.readyIn==0), (b.readyIn==0)
       if aReady and bReady then
-        if a.role~=b.role             then return a.role < b.role end     -- Tanks first
-        if a.readySince~=b.readySince then return a.readySince < b.readySince end -- FIFO ready
-        if a.pri~=b.pri               then return a.pri < b.pri end       -- manual priority
+        if a.role~=b.role             then return a.role < b.role end      -- Role order
+        if a.readySince~=b.readySince then return a.readySince < b.readySince end -- FIFO ready within role
+        if a.pri~=b.pri               then return a.pri < b.pri end        -- Manual spell priority
         return a.raw < b.raw
       end
       if a.readyIn~=b.readyIn         then return a.readyIn < b.readyIn end
@@ -206,26 +215,11 @@ local function Init()
     end
   end
 
-  -- ---------- Auto-TTS (global top; window visibility not required) ----------
+  -- ---------- Auto-TTS ----------
   local function AutoTTS()
     local db = DB(); if not db.ttsNext then return end
-    if db.onlyMine then
-      -- announce only if top is me
-      local top = (entries[1] and entries[1].readyIn==0) and entries[1] or nil
-      if not top or top.unit~="player" then return end
-      local key = "TOP:"..top.guid..":"..top.spellID
-      if key == lastAnnouncedTopKey then return end
-      if C_VoiceChat and C_VoiceChat.SpeakText then
-        C_VoiceChat.SpeakText(0, SpellName(top.spellID).." next", Enum.VoiceTtsDestination.LocalPlayback, 0, 100)
-      else
-        print("|cff33ff99GroupCC|r:", SpellName(top.spellID).." next")
-      end
-      lastAnnouncedTopKey = key
-      return
-    end
-
-    -- everyone
     local top = (entries[1] and entries[1].readyIn==0) and entries[1] or nil
+    if db.onlyMine and (not top or top.unit~="player") then return end
     if not top then return end
     local key = "TOP:"..top.guid..":"..top.spellID
     if key == lastAnnouncedTopKey then return end
@@ -244,9 +238,7 @@ local function Init()
     AutoTTS()
   end
 
-  -- ---------- Reset button logic ----------
-  -- Resets the "readySince" timestamps for spells that are currently ready (<=0s),
-  -- so their order falls back to Tank-first -> Priority -> Name (clean slate).
+  -- ---------- Reset runtime order ----------
   local function ResetRuntimeOrder()
     for guid, pool in pairs(spellsByGUID) do
       readySince[guid] = readySince[guid] or {}
@@ -259,7 +251,7 @@ local function Init()
         end
       end
     end
-    lastAnnouncedTopKey = nil  -- allow a fresh TTS on the new top
+    lastAnnouncedTopKey = nil
     Refresh()
   end
 
@@ -279,7 +271,7 @@ local function Init()
     frame:SetPoint(w.point or "CENTER", UIParent, w.rel or "CENTER", w.x or 0, w.y or 0)
   end
 
-  -- ---------- UI (fixed row pool) ----------
+  -- ---------- UI ----------
   frame=CreateFrame("Frame","GroupCCRuntimeFrame",UIParent,"BasicFrameTemplateWithInset")
   frame:SetResizable(true)
   if frame.SetResizeBounds then frame:SetResizeBounds(240,140) elseif frame.SetMinResize then frame:SetMinResize(240,140) end
@@ -292,7 +284,7 @@ local function Init()
   frame:SetScript("OnDragStart", frame.StartMoving)
   frame:SetScript("OnDragStop",  function(self) self:StopMovingOrSizing(); SaveWindow() end)
 
-  -- Sizer (bottom-right)
+  -- sizer
   local sizer=CreateFrame("Frame", nil, frame)
   sizer:SetSize(18,18)
   sizer:SetPoint("BOTTOMRIGHT")
@@ -304,7 +296,7 @@ local function Init()
   frame.title=frame:CreateFontString(nil,"OVERLAY","GameFontHighlight")
   frame.title:SetPoint("TOP",0,-5); frame.title:SetText("GroupCC")
 
-  -- Reset button aligned with the Close "X"
+  -- Reset button aligned with Close "X"
   local close = _G[frame:GetName().."CloseButton"]
   local resetBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
   resetBtn:SetText("Reset")
@@ -312,20 +304,20 @@ local function Init()
   resetBtn:SetScale(0.9)
   resetBtn:ClearAllPoints()
   if close then
-    resetBtn:SetPoint("RIGHT", close, "LEFT", -6, 0)  -- perfectly aligned beside the X
+    resetBtn:SetPoint("RIGHT", close, "LEFT", -6, 0)
   else
-    resetBtn:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -28, -6) -- fallback
+    resetBtn:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -28, -6)
   end
   resetBtn:SetScript("OnClick", function() ResetRuntimeOrder() end)
   resetBtn:SetScript("OnEnter", function(selfBtn)
     GameTooltip:SetOwner(selfBtn, "ANCHOR_LEFT")
     GameTooltip:SetText("Reset queue order", 1,1,1)
-    GameTooltip:AddLine("Re-sorts ready spells to Tank-first + Priority order.", 0.85,0.85,0.85, true)
+    GameTooltip:AddLine("Re-sorts ready spells by Role → Spell priority → Name.", 0.85,0.85,0.85, true)
     GameTooltip:Show()
   end)
   resetBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-  -- Precreate rows
+  -- rows
   for i=1,MAX_ROWS do
     local fs=frame:CreateFontString(nil,"OVERLAY","GameFontNormal")
     fs:SetText(""); fs:Hide()
@@ -339,24 +331,45 @@ local function Init()
     if ticker>=UPDATE_INTERVAL then Refresh(); ticker=0 end
   end)
 
+  -- ---------- Confirm popup for incoming sync ----------
+  StaticPopupDialogs = StaticPopupDialogs or {}
+  StaticPopupDialogs["GROUPCC_ACCEPT_SYNC"] = {
+    text = "GroupCC: %s wants to update your settings.\n\nApply %s?",
+    button1 = "Accept",
+    button2 = "Decline",
+    OnAccept = function(self, data)
+      if data and data.kind=="ROLE" and data.payload then
+        DB().roleOrder = data.payload
+      elseif data and data.kind=="SPELL" and data.payload then
+        DB().priorityOrder = data.payload
+      end
+      if GroupCCRuntime_ForceRefresh then GroupCCRuntime_ForceRefresh() end
+      print("|cff33ff99GroupCC|r: Update applied.")
+    end,
+    timeout = 10,
+    whileDead = 1,
+    hideOnEscape = 1,
+    preferredIndex = 3,
+  }
+
+  local function showConfirm(kind, sender, payload)
+    local human = (kind=="ROLE") and "role priority" or "spell priority"
+    local data = { kind = kind, payload = payload }
+    StaticPopup_Show("GROUPCC_ACCEPT_SYNC", sender or "someone", human, data)
+  end
+
   -- ---------- Events ----------
   local ef=CreateFrame("Frame")
   ef:RegisterEvent("PLAYER_ENTERING_WORLD")
   ef:RegisterEvent("GROUP_ROSTER_UPDATE")
   ef:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-  ef:SetScript("OnEvent", function(_,ev)
+  ef:RegisterEvent("CHAT_MSG_ADDON")
+  ef:SetScript("OnEvent", function(_,ev, ...)
     if ev=="PLAYER_ENTERING_WORLD" or ev=="GROUP_ROSTER_UPDATE" then
       local oldLC,lastRS = lastCast,readySince
       RebuildParty()
-      -- carry over known lastCast / readySince where possible
-      for g,sp in pairs(oldLC) do
-        lastCast[g]=lastCast[g] or {}
-        for id,t in pairs(sp) do if not lastCast[g][id] then lastCast[g][id]=t end end
-      end
-      for g,sp in pairs(lastRS or {}) do
-        readySince[g]=readySince[g] or {}
-        for id,t in pairs(sp) do if not readySince[g][id] then readySince[g][id]=t end end
-      end
+      for g,sp in pairs(oldLC) do lastCast[g]=lastCast[g] or {}; for id,t in pairs(sp) do if not lastCast[g][id] then lastCast[g][id]=t end end end
+      for g,sp in pairs(lastRS or {}) do readySince[g]=readySince[g] or {}; for id,t in pairs(sp) do if not readySince[g][id] then readySince[g][id]=t end end end
       lastAnnouncedTopKey=nil
       if frame:IsShown() then Refresh() end
 
@@ -366,8 +379,53 @@ local function Init()
         if spellsByGUID[src] and spellsByGUID[src][id] and DB().enabledSpells[id] then
           lastCast[src][id]=now()
           readySince[src]=readySince[src] or {}; readySince[src][id]=nil
-          lastAnnouncedTopKey=nil -- allow re-announce next top
+          lastAnnouncedTopKey=nil
           if frame:IsShown() then Refresh() end
+        end
+      end
+
+    elseif ev=="CHAT_MSG_ADDON" then
+      local prefix, text, channel, sender = ...
+      if prefix ~= ADDON_PREFIX then return end
+      if not UnitInParty(sender) and not UnitInRaid(sender) then return end
+
+      -- Expect:
+      --  "V1|ROLE|TANK,HEALER,DAMAGER"
+      --  "V1|SPELL|46968,115750,..."
+      --  "V1|CALL|NOW|spellID|guid"
+      local ver, kind, rest = string.match(text, "^([^|]+)|([^|]+)|(.+)$")
+      if ver ~= "V1" or not kind then return end
+
+      if kind == "ROLE" then
+        local order = {}
+        for role in string.gmatch(rest, "([^,]+)") do
+          role = string.upper((role or ""):match("^%s*(.-)%s*$"))
+          if role=="TANK" or role=="HEALER" or role=="DAMAGER" then table.insert(order, role) end
+        end
+        if #order==3 then
+          showConfirm("ROLE", sender, order)
+        end
+
+      elseif kind == "SPELL" then
+        local newOrder = {}
+        for id in string.gmatch(rest, "%d+") do table.insert(newOrder, tonumber(id)) end
+        if #newOrder > 0 then
+          showConfirm("SPELL", sender, newOrder)
+        end
+
+      elseif kind == "CALL" then
+        local callType, a, b = rest:match("^([^|]+)|([^|]+)|([^|]+)$")
+        if callType == "NOW" then
+          local spellID = tonumber(a)
+          local targetGUID = b
+          if spellID and targetGUID and targetGUID == UnitGUID("player") then
+            local line = "Use "..SpellName(spellID).." now"
+            if C_VoiceChat and C_VoiceChat.SpeakText then
+              C_VoiceChat.SpeakText(0, line, Enum.VoiceTtsDestination.LocalPlayback, 0, 100)
+            else
+              print("|cff33ff99GroupCC|r:", line)
+            end
+          end
         end
       end
     end
@@ -385,7 +443,7 @@ local function Init()
     end
   end
 
-  -- /gccnow: announce the true global next (entries[1])
+  -- Local-only TTS: announce the true global next on your client
   function GroupCCRuntime_AnnounceNow()
     EnsureDefaults(); BuildPriorityIndex(); BuildEntries()
     local e=entries[1]
@@ -401,7 +459,26 @@ local function Init()
     end
   end
 
-  -- Debug helper for /gcc status
+  -- Broadcast to party/raid: pick the top entry and send a targeted "NOW" call
+  function GroupCCRuntime_CallNext(broadcast)
+    EnsureDefaults(); BuildPriorityIndex(); BuildEntries()
+    local e=entries[1]
+    if not e then
+      print("|cff33ff99GroupCC|r: No AoE CC in queue.")
+      return
+    end
+    if not broadcast then
+      -- local behavior fallback
+      GroupCCRuntime_AnnounceNow()
+      return
+    end
+    local chan = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or nil)
+    if not chan then print("|cff33ff99GroupCC|r: Not in a group.") return end
+    local payload = ("V1|CALL|NOW|%d|%s"):format(e.spellID, e.guid)
+    C_ChatInfo.SendAddonMessage(ADDON_PREFIX, payload, chan)
+    print("|cff33ff99GroupCC|r: Called "..(e.raw or "?").." to use "..SpellName(e.spellID).." now.")
+  end
+
   function GroupCCRuntime_DebugTop()
     BuildPriorityIndex(); BuildEntries()
     local e=entries[1]
@@ -416,7 +493,7 @@ local function Init()
     EnsureDefaults(); RebuildParty(); Refresh()
   end
 
-  -- ---------- Background TTS ticker (runs even if the window is hidden) ----------
+  -- Background TTS ticker
   if C_Timer and C_Timer.NewTicker then
     C_Timer.NewTicker(0.4, function()
       pcall(function()

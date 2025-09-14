@@ -1,6 +1,9 @@
--- GroupCCOptions.lua
--- Wider, movable options window with working scrollbars that hide when not needed.
--- TTS + OnlyMine toggles, scale slider, per-spell toggles, and priority editor.
+-- GroupCC Options (larger window + tidy layout)
+-- - Bigger frame (900 x 720)
+-- - Toolbar right-aligned under header
+-- - ASCII ">" in labels (fixes missing glyph)
+-- - Scroll panes spaced lower, scrollbars auto-hide
+-- - ESC closes window
 
 local function DB() _G.GroupCCDB=_G.GroupCCDB or {}; return _G.GroupCCDB end
 
@@ -17,22 +20,22 @@ local function EnsureDefaults()
   if db.ttsNext==nil then db.ttsNext=true end
   if db.onlyMine==nil then db.onlyMine=false end
   db.window = db.window or {w=360,h=260,scale=1,point="CENTER",rel="CENTER",x=0,y=0}
+  db.roleOrder = db.roleOrder or {"TANK","HEALER","DAMAGER"}
+  if db.autoOpenDungeon == nil then db.autoOpenDungeon = false end
 end
 EnsureDefaults()
 
--- Helper: hide scrollbar if not needed
 local function UpdateScrollbar(sf)
   if not sf then return end
   if sf.UpdateScrollChildRect then sf:UpdateScrollChildRect() end
   local range = sf:GetVerticalScrollRange() or 0
-  local sb = sf.ScrollBar or (sf.GetName and _G[sf:GetName().."ScrollBar"]) -- template differences
-  if sb then
-    if range <= 0.5 then sb:Hide() else sb:Show() end
-  end
+  local sb = sf.ScrollBar or (sf.GetName and _G[sf:GetName().."ScrollBar"])
+  if sb then if range <= 0.5 then sb:Hide() else sb:Show() end end
 end
 
+-- === Shell ===
 local opt = CreateFrame("Frame","GroupCCOptionsFrame",UIParent,"BasicFrameTemplateWithInset")
-opt:SetSize(760, 600)  -- wider
+opt:SetSize(900, 720)                             -- bigger!
 opt:SetPoint("CENTER")
 opt:Hide()
 opt:EnableMouse(true)
@@ -40,9 +43,7 @@ opt:SetMovable(true)
 opt:RegisterForDrag("LeftButton")
 opt:SetScript("OnDragStart", opt.StartMoving)
 opt:SetScript("OnDragStop",  opt.StopMovingOrSizing)
-
--- (optional) allow resizing if you want
-if opt.SetResizeBounds then opt:SetResizeBounds(640, 420) end
+if opt.SetResizeBounds then opt:SetResizeBounds(860, 640) end
 opt:SetResizable(true)
 local sizer=CreateFrame("Frame",nil,opt)
 sizer:SetSize(18,18); sizer:SetPoint("BOTTOMRIGHT"); sizer:EnableMouse(true)
@@ -54,37 +55,47 @@ opt.title=opt:CreateFontString(nil,"OVERLAY","GameFontHighlight")
 opt.title:SetPoint("TOP",0,-6)
 opt.title:SetText("GroupCC Options")
 
--- Top toggles
-local tts=CreateFrame("CheckButton",nil,opt,"UICheckButtonTemplate")
-tts:SetPoint("TOPLEFT",12,-34)
-tts.text:SetText("Enable Text-to-Speech")
-tts:SetChecked(DB().ttsNext)
-tts:SetScript("OnClick", function(self) DB().ttsNext = self:GetChecked() and true or false end)
+-- === Left column toggles ===
+local topY = -34
+local function addCheck(label, y, checked, onClick)
+  local cb=CreateFrame("CheckButton",nil,opt,"UICheckButtonTemplate")
+  cb:SetPoint("TOPLEFT",12,y)
+  cb.text:SetText(label)
+  cb:SetChecked(checked)
+  cb:SetScript("OnClick", onClick)
+  return cb
+end
 
-local mine=CreateFrame("CheckButton",nil,opt,"UICheckButtonTemplate")
-mine:SetPoint("TOPLEFT", tts, "BOTTOMLEFT", 0, -8)
-mine.text:SetText("Hear only my spells (auto-TTS)")
-mine:SetChecked(DB().onlyMine)
-mine:SetScript("OnClick", function(self)
+local tts = addCheck("Enable Text-to-Speech", topY, DB().ttsNext, function(self)
+  DB().ttsNext = self:GetChecked() and true or false
+end)
+
+local mine = addCheck("Hear only my spells (auto-TTS)", topY-28, DB().onlyMine, function(self)
   DB().onlyMine = self:GetChecked() and true or false
   if GroupCCRuntime_ForceRefresh then GroupCCRuntime_ForceRefresh() end
 end)
 
--- Scale
+local autoOpen = addCheck("Open window when in dungeon", topY-56, DB().autoOpenDungeon, function(self)
+  DB().autoOpenDungeon = self:GetChecked() and true or false
+end)
+
+-- === Scale row ===
 local scaleLbl=opt:CreateFontString(nil,"OVERLAY","GameFontNormal")
-scaleLbl:SetPoint("TOPLEFT", mine, "BOTTOMLEFT", 4, -14)
+scaleLbl:SetPoint("TOPLEFT", 12, topY-96)
 scaleLbl:SetText("Window Scale")
 
 local scale=CreateFrame("Slider", nil, opt, "OptionsSliderTemplate")
 scale:SetPoint("TOPLEFT", scaleLbl, "BOTTOMLEFT", -6, -8)
-scale:SetWidth(200)
+scale:SetWidth(360)                                -- wider slider
 scale:SetMinMaxValues(0.7,1.5)
 scale:SetValueStep(0.05)
 scale:SetObeyStepOnDrag(true)
 scale.Low:SetText("0.7")
 scale.High:SetText("1.5")
 scale:SetValue(DB().window.scale or 1)
-scale.Text:ClearAllPoints(); scale.Text:SetPoint("TOP", scale, "BOTTOM", 0, 0)
+scale.Text:ClearAllPoints()
+scale.Text:SetPoint("LEFT", scale, "RIGHT", 12, 0)
+scale.Text:SetJustifyH("LEFT")
 scale.Text:SetText(string.format("Scale: %.2f", scale:GetValue()))
 scale:SetScript("OnValueChanged", function(self,val)
   DB().window.scale = val
@@ -92,23 +103,76 @@ scale:SetScript("OnValueChanged", function(self,val)
   if GroupCCRuntimeFrame then GroupCCRuntimeFrame:SetScale(val) end
 end)
 
-local reset=CreateFrame("Button", nil, opt, "UIPanelButtonTemplate")
-reset:SetSize(220, 24)
-reset:SetPoint("LEFT", scale, "RIGHT", 16, 0)
-reset:SetText("Reset All to Defaults")
-reset:SetScript("OnClick", function()
-  DB().enabledSpells = {}
-  for _, list in pairs(_G.GroupCC_ClassAOE or {}) do
-    for _, id in ipairs(list) do DB().enabledSpells[id] = true end
-  end
-  if GroupCCRuntime_ForceRefresh then GroupCCRuntime_ForceRefresh() end
-  opt:RebuildSpellList(); opt:RebuildPriorityList()
+-- === Toolbar (right-aligned) ===
+local toolbar = CreateFrame("Frame", nil, opt)
+toolbar:SetPoint("TOPRIGHT", opt, "TOPRIGHT", -12, topY-96)
+toolbar:SetSize(1,1)
+
+local helpBtn = CreateFrame("Button", nil, toolbar, "UIPanelButtonTemplate")
+helpBtn:SetSize(170, 24)
+helpBtn:SetPoint("RIGHT", toolbar, "RIGHT", 0, 0)
+helpBtn:SetText("Show Slash Commands")
+helpBtn:SetScript("OnClick", function() if _G.GroupCC_PrintHelp then _G.GroupCC_PrintHelp() end end)
+
+local shareBtn = CreateFrame("Button", nil, toolbar, "UIPanelButtonTemplate")
+shareBtn:SetSize(140, 24)
+shareBtn:SetPoint("RIGHT", helpBtn, "LEFT", -8, 0)
+shareBtn:SetText("Share to Group")
+shareBtn:SetScript("OnClick", function()
+  if SlashCmdList and SlashCmdList["GCCSHARE"] then SlashCmdList["GCCSHARE"]() end
 end)
 
--- Left scroll: per-spell toggles
+local openBtn = CreateFrame("Button", nil, toolbar, "UIPanelButtonTemplate")
+openBtn:SetSize(200, 24)
+openBtn:SetPoint("RIGHT", shareBtn, "LEFT", -8, 0)
+openBtn:SetText("Open/Toggle Runtime Window")
+openBtn:SetScript("OnClick", function() if GroupCCRuntime_Toggle then GroupCCRuntime_Toggle() end end)
+
+-- === Role priority row (ASCII '>' to avoid missing glyph) ===
+local roleHdr = opt:CreateFontString(nil,"OVERLAY","GameFontNormal")
+roleHdr:SetPoint("TOPLEFT", 12, topY-136)
+roleHdr:SetText("Role Priority (highest > lowest)")
+
+local roleDrop = CreateFrame("Frame", "GroupCC_RoleDrop", opt, "UIDropDownMenuTemplate")
+roleDrop:SetPoint("TOPLEFT", roleHdr, "BOTTOMLEFT", -16, -6)
+
+local rolePerms = {
+  {"TANK","HEALER","DAMAGER"},
+  {"TANK","DAMAGER","HEALER"},
+  {"HEALER","TANK","DAMAGER"},
+  {"HEALER","DAMAGER","TANK"},
+  {"DAMAGER","TANK","HEALER"},
+  {"DAMAGER","HEALER","TANK"},
+}
+local function roleLabel(t) return (t[1].." > "..t[2].." > "..t[3]) end
+
+function opt:RefreshRoleDropdown()
+  local cur = DB().roleOrder or {"TANK","HEALER","DAMAGER"}
+  UIDropDownMenu_SetWidth(roleDrop, 280)
+  UIDropDownMenu_SetText(roleDrop, roleLabel(cur))
+end
+
+UIDropDownMenu_Initialize(roleDrop, function(self, level, menuList)
+  for _,perm in ipairs(rolePerms) do
+    local info = UIDropDownMenu_CreateInfo()
+    info.text = roleLabel(perm)
+    info.func = function()
+      DB().roleOrder = {perm[1],perm[2],perm[3]}
+      if GroupCCRuntime_ForceRefresh then GroupCCRuntime_ForceRefresh() end
+      opt:RefreshRoleDropdown()
+    end
+    info.checked = (DB().roleOrder[1]==perm[1] and DB().roleOrder[2]==perm[2] and DB().roleOrder[3]==perm[3])
+    UIDropDownMenu_AddButton(info)
+  end
+end)
+
+-- === Panes (pushed down further) ===
+local PANE_TOP_OFFSET = -255
+
+-- Left: per-spell toggles
 local leftBox = CreateFrame("Frame", nil, opt, "InsetFrameTemplate3")
-leftBox:SetPoint("TOPLEFT", 10, -180)
-leftBox:SetPoint("BOTTOMRIGHT", -390, 10)
+leftBox:SetPoint("TOPLEFT", 10, PANE_TOP_OFFSET)
+leftBox:SetPoint("BOTTOMRIGHT", -460, 12)          -- slightly narrower to give right pane more room
 
 local leftScroll = CreateFrame("ScrollFrame", "GroupCC_LeftScroll", leftBox, "UIPanelScrollFrameTemplate")
 leftScroll:SetPoint("TOPLEFT", 4, -4)
@@ -150,10 +214,10 @@ function opt:RebuildSpellList()
   UpdateScrollbar(leftScroll)
 end
 
--- Right scroll: priority editor
+-- Right: manual spell priority
 local rightBox = CreateFrame("Frame", nil, opt, "InsetFrameTemplate3")
-rightBox:SetPoint("TOPLEFT", opt, "TOPRIGHT", -380, -180)
-rightBox:SetPoint("BOTTOMRIGHT", -10, 10)
+rightBox:SetPoint("TOPLEFT", opt, "TOPRIGHT", -440, PANE_TOP_OFFSET)
+rightBox:SetPoint("BOTTOMRIGHT", -10, 12)
 
 local rightScroll = CreateFrame("ScrollFrame", "GroupCC_RightScroll", rightBox, "UIPanelScrollFrameTemplate")
 rightScroll:SetPoint("TOPLEFT", 4, -4)
@@ -182,22 +246,22 @@ function opt:RebuildPriorityList()
   for i,spellID in ipairs(DB().priorityOrder) do
     local row=CreateFrame("Frame", nil, rightContent)
     row:SetPoint("TOPLEFT",6,y)
-    row:SetSize(320,24)
+    row:SetSize(380,24)
 
     local txt=row:CreateFontString(nil,"OVERLAY","GameFontNormal")
     txt:SetPoint("LEFT",0,0)
     txt:SetText(string.format("%d) %s", i, SpellName(spellID)))
 
     local up =CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    up:SetSize(48,20); up:SetPoint("RIGHT",-96,0); up:SetText("Up")
+    up:SetSize(50,20); up:SetPoint("RIGHT",-106,0); up:SetText("Up")
     up:SetScript("OnClick", function() MovePriorityIndex(i, i-1) end)
 
     local dn =CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    dn:SetSize(48,20); dn:SetPoint("RIGHT",-48,0); dn:SetText("Down")
+    dn:SetSize(62,20); dn:SetPoint("RIGHT",-56,0); dn:SetText("Down")
     dn:SetScript("OnClick", function() MovePriorityIndex(i, i+1) end)
 
     local top=CreateFrame("Button", nil, row, "UIPanelButtonTemplate")
-    top:SetSize(48,20); top:SetPoint("RIGHT",0,0); top:SetText("Top")
+    top:SetSize(50,20); top:SetPoint("RIGHT",0,0); top:SetText("Top")
     top:SetScript("OnClick", function() MovePriorityIndex(i, 1) end)
 
     table.insert(self.priorityRows,{row=row})
@@ -212,6 +276,7 @@ end
 -- Build UI now
 opt:RebuildSpellList()
 opt:RebuildPriorityList()
+opt:RefreshRoleDropdown()
 
 -- Keep scrollbars honest on resize
 opt:SetScript("OnSizeChanged", function()
@@ -231,6 +296,5 @@ function GroupCCOptions_Toggle()
   end
 end
 
--- Make the Options window close when the Escape key / Game Menu is opened
+-- ESC closes
 table.insert(UISpecialFrames, "GroupCCOptionsFrame")
-
