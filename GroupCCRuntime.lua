@@ -1,0 +1,439 @@
+-- GroupCCRuntime.lua
+-- FIFO ready queue + Tank-only priority + fixed-row pool + robust TTS
+-- Includes: background TTS ticker (works with window hidden) and "Reset" button aligned with the close X.
+
+GroupCC_LastError = nil
+GroupCCRuntime_InitDone = false
+
+local function DB() _G.GroupCCDB=_G.GroupCCDB or {}; return _G.GroupCCDB end
+local function safeErr(msg) print("|cffff4444GroupCC runtime error:|r", msg) end
+
+local function Init()
+  local wipe = wipe or function(t) for k in pairs(t) do t[k]=nil end end
+
+  -- ---------- State ----------
+  local frame
+  local rows = {}
+  local MAX_ROWS = 24
+  local LINE_H  = 18
+  local TOP_PAD = 30
+  local LEFT_PAD = 12
+
+  local partyByGUID, classByGUID = {}, {}
+  local spellsByGUID, lastCast   = {}, {}
+  local readySince               = {}   -- readySince[guid][spellID] = time when it hit 0s
+  local entries, priorityIndex   = {}, {}
+  local lastAnnouncedTopKey      = nil  -- de-dupe key for auto TTS
+  local ticker, UPDATE_INTERVAL  = 0, 0.2
+
+  -- ---------- Helpers ----------
+  local function now() return GetTime() end
+
+  local function SpellName(id)
+    if C_Spell and C_Spell.GetSpellInfo then
+      local info = C_Spell.GetSpellInfo(id)
+      if info and info.name then return info.name end
+    end
+    if _G.GetSpellInfo then
+      local n = _G.GetSpellInfo(id)
+      if n then return n end
+    end
+    return "Spell "..id
+  end
+
+  local function BaseCD(id)
+    if _G.GetSpellBaseCooldown then
+      local ms=_G.GetSpellBaseCooldown(id)
+      if ms and ms>0 then return ms/1000 end
+    end
+    return 0
+  end
+
+  local function ColorName(name, cls)
+    local c=RAID_CLASS_COLORS and RAID_CLASS_COLORS[cls]
+    return c and ("|cff%02x%02x%02x%s|r"):format(c.r*255,c.g*255,c.b*255,name) or name
+  end
+
+  -- Tanks first among ties; others equal
+  local function RoleWeight_TankOnly(unit)
+    return (UnitGroupRolesAssigned(unit)=="TANK") and 1 or 2
+  end
+
+  -- ---------- Defaults ----------
+  local function DefaultOrder()
+    local o={}
+    for _,cls in ipairs({"PALADIN","WARRIOR","SHAMAN","HUNTER"}) do
+      local l=_G.GroupCC_ClassAOE and _G.GroupCC_ClassAOE[cls]
+      if l then for _,id in ipairs(l) do table.insert(o,id) end end
+    end
+    return o
+  end
+
+  local function EnsureDefaults()
+    local db=DB()
+    db.enabledSpells = db.enabledSpells or {}
+    for _,id in ipairs(DefaultOrder()) do
+      if db.enabledSpells[id]==nil then db.enabledSpells[id]=true end
+    end
+    db.priorityOrder = db.priorityOrder or DefaultOrder()
+    if #db.priorityOrder==0 then db.priorityOrder=DefaultOrder() end
+    if db.ttsNext==nil   then db.ttsNext=true end
+    if db.onlyMine==nil  then db.onlyMine=false end
+    db.window = db.window or { w=360, h=260, scale=1, point="CENTER", rel="CENTER", x=0, y=0 }
+  end
+  EnsureDefaults()
+
+  -- ---------- Priority ----------
+  local function BuildPriorityIndex()
+    wipe(priorityIndex)
+    for i,id in ipairs(DB().priorityOrder) do
+      priorityIndex[id]=i
+    end
+  end
+
+  -- ---------- Party scan ----------
+  local function Seed(guid, cls)
+    spellsByGUID[guid]=spellsByGUID[guid] or {}
+    lastCast[guid]=lastCast[guid] or {}
+    readySince[guid]=readySince[guid] or {}
+    local list=_G.GroupCC_ClassAOE and _G.GroupCC_ClassAOE[cls]
+    if not list then return end
+    for _,id in ipairs(list) do
+      if DB().enabledSpells[id] then
+        spellsByGUID[guid][id]=true
+        if not lastCast[guid][id] then
+          lastCast[guid][id]=now()-BaseCD(id)                      -- seed ready
+          if not readySince[guid][id] then readySince[guid][id]=now()-9999 end
+        end
+      end
+    end
+  end
+
+  local function RebuildParty()
+    wipe(partyByGUID); wipe(classByGUID); wipe(spellsByGUID)
+    local me=UnitGUID("player")
+    if me then
+      local _,cls=UnitClass("player")
+      partyByGUID[me]="player"; classByGUID[me]=cls; Seed(me,cls)
+    end
+    local n=GetNumGroupMembers()
+    if n and n>0 then
+      if IsInRaid() then
+        for i=1,n do
+          local u="raid"..i
+          if UnitExists(u) then
+            local g=UnitGUID(u)
+            if g then local _,c=UnitClass(u); partyByGUID[g]=u; classByGUID[g]=c; Seed(g,c) end
+          end
+        end
+      else
+        for i=1,GetNumSubgroupMembers() do
+          local u="party"..i
+          if UnitExists(u) then
+            local g=UnitGUID(u)
+            if g then local _,c=UnitClass(u); partyByGUID[g]=u; classByGUID[g]=c; Seed(g,c) end
+          end
+        end
+      end
+    end
+  end
+
+  -- ---------- Entries ----------
+  local function BuildEntries()
+    wipe(entries)
+    for guid,pool in pairs(spellsByGUID) do
+      local unit=partyByGUID[guid]
+      if unit then
+        local raw=UnitName(unit) or "?"
+        local name=ColorName(raw, classByGUID[guid])
+        local roleW=RoleWeight_TankOnly(unit)
+        for id in pairs(pool) do
+          if DB().enabledSpells[id] then
+            local cd=BaseCD(id)
+            local cast=lastCast[guid][id] or (now()-cd)
+            local remain=(cast+cd)-now(); if remain<0 then remain=0 end
+
+            readySince[guid]=readySince[guid] or {}
+            if remain==0 then
+              if not readySince[guid][id] then readySince[guid][id]=now() end
+            else
+              readySince[guid][id]=nil
+            end
+
+            table.insert(entries,{
+              guid=guid, unit=unit, raw=raw, name=name,
+              spellID=id, readyIn=remain, readySince=readySince[guid][id] or math.huge,
+              role=roleW, pri=priorityIndex[id] or 999
+            })
+          end
+        end
+      end
+    end
+
+    table.sort(entries,function(a,b)
+      local aReady, bReady = (a.readyIn==0), (b.readyIn==0)
+      if aReady and bReady then
+        if a.role~=b.role             then return a.role < b.role end     -- Tanks first
+        if a.readySince~=b.readySince then return a.readySince < b.readySince end -- FIFO ready
+        if a.pri~=b.pri               then return a.pri < b.pri end       -- manual priority
+        return a.raw < b.raw
+      end
+      if a.readyIn~=b.readyIn         then return a.readyIn < b.readyIn end
+      if a.role~=b.role               then return a.role < b.role end
+      if a.pri~=b.pri                 then return a.pri < b.pri end
+      return a.raw < b.raw
+    end)
+  end
+
+  -- ---------- UI paint ----------
+  local function Paint()
+    local usableW = math.max(50, frame:GetWidth() - LEFT_PAD*2)
+    for i=1,MAX_ROWS do
+      local r=rows[i]
+      r:ClearAllPoints()
+      r:SetPoint("TOPLEFT", frame, "TOPLEFT", LEFT_PAD, -TOP_PAD - (i-1)*LINE_H)
+      r:SetWidth(usableW); r:SetHeight(LINE_H)
+      r:SetJustifyH("LEFT"); r:SetJustifyV("TOP")
+      if r.SetWordWrap then r:SetWordWrap(false) end
+      if r.SetNonSpaceWrap then r:SetNonSpaceWrap(false) end
+      r:Hide(); r:SetText("")
+    end
+    local visible = math.min(#entries, MAX_ROWS)
+    for i=1,visible do
+      local e=entries[i]; local r=rows[i]
+      r:SetText(("%s - %s (%.1fs)"):format(e.name, SpellName(e.spellID), e.readyIn))
+      r:Show()
+    end
+  end
+
+  -- ---------- Auto-TTS (global top; window visibility not required) ----------
+  local function AutoTTS()
+    local db = DB(); if not db.ttsNext then return end
+    if db.onlyMine then
+      -- announce only if top is me
+      local top = (entries[1] and entries[1].readyIn==0) and entries[1] or nil
+      if not top or top.unit~="player" then return end
+      local key = "TOP:"..top.guid..":"..top.spellID
+      if key == lastAnnouncedTopKey then return end
+      if C_VoiceChat and C_VoiceChat.SpeakText then
+        C_VoiceChat.SpeakText(0, SpellName(top.spellID).." next", Enum.VoiceTtsDestination.LocalPlayback, 0, 100)
+      else
+        print("|cff33ff99GroupCC|r:", SpellName(top.spellID).." next")
+      end
+      lastAnnouncedTopKey = key
+      return
+    end
+
+    -- everyone
+    local top = (entries[1] and entries[1].readyIn==0) and entries[1] or nil
+    if not top then return end
+    local key = "TOP:"..top.guid..":"..top.spellID
+    if key == lastAnnouncedTopKey then return end
+    if C_VoiceChat and C_VoiceChat.SpeakText then
+      C_VoiceChat.SpeakText(0, SpellName(top.spellID).." next", Enum.VoiceTtsDestination.LocalPlayback, 0, 100)
+    else
+      print("|cff33ff99GroupCC|r:", SpellName(top.spellID).." next")
+    end
+    lastAnnouncedTopKey = key
+  end
+
+  local function Refresh()
+    BuildPriorityIndex()
+    BuildEntries()
+    Paint()
+    AutoTTS()
+  end
+
+  -- ---------- Reset button logic ----------
+  -- Resets the "readySince" timestamps for spells that are currently ready (<=0s),
+  -- so their order falls back to Tank-first -> Priority -> Name (clean slate).
+  local function ResetRuntimeOrder()
+    for guid, pool in pairs(spellsByGUID) do
+      readySince[guid] = readySince[guid] or {}
+      for spellID in pairs(pool) do
+        local cd   = BaseCD(spellID)
+        local cast = lastCast[guid][spellID] or (now() - cd)
+        local rem  = (cast + cd) - now()
+        if rem <= 0 then
+          readySince[guid][spellID] = now()
+        end
+      end
+    end
+    lastAnnouncedTopKey = nil  -- allow a fresh TTS on the new top
+    Refresh()
+  end
+
+  -- ---------- Window save/restore ----------
+  local function SaveWindow()
+    local db=DB(); local p,_,r,x,y=frame:GetPoint(1)
+    db.window.w, db.window.h = frame:GetWidth(), frame:GetHeight()
+    db.window.scale = frame:GetScale()
+    db.window.point, db.window.rel, db.window.x, db.window.y = p, r, x, y
+  end
+
+  local function RestoreWindow()
+    local w=DB().window
+    frame:SetSize(w.w or 360, w.h or 260)
+    frame:SetScale(w.scale or 1)
+    frame:ClearAllPoints()
+    frame:SetPoint(w.point or "CENTER", UIParent, w.rel or "CENTER", w.x or 0, w.y or 0)
+  end
+
+  -- ---------- UI (fixed row pool) ----------
+  frame=CreateFrame("Frame","GroupCCRuntimeFrame",UIParent,"BasicFrameTemplateWithInset")
+  frame:SetResizable(true)
+  if frame.SetResizeBounds then frame:SetResizeBounds(240,140) elseif frame.SetMinResize then frame:SetMinResize(240,140) end
+  frame:SetSize(360,260)
+  frame:SetPoint("CENTER")
+  frame:Hide()
+  frame:EnableMouse(true)
+  frame:SetMovable(true)
+  frame:RegisterForDrag("LeftButton")
+  frame:SetScript("OnDragStart", frame.StartMoving)
+  frame:SetScript("OnDragStop",  function(self) self:StopMovingOrSizing(); SaveWindow() end)
+
+  -- Sizer (bottom-right)
+  local sizer=CreateFrame("Frame", nil, frame)
+  sizer:SetSize(18,18)
+  sizer:SetPoint("BOTTOMRIGHT")
+  sizer:EnableMouse(true)
+  sizer:SetScript("OnMouseDown", function() frame:StartSizing("BOTTOMRIGHT") end)
+  sizer:SetScript("OnMouseUp",   function() frame:StopMovingOrSizing(); SaveWindow() end)
+  local tex=sizer:CreateTexture(nil,"OVERLAY"); tex:SetAllPoints(); tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+
+  frame.title=frame:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+  frame.title:SetPoint("TOP",0,-5); frame.title:SetText("GroupCC")
+
+  -- Reset button aligned with the Close "X"
+  local close = _G[frame:GetName().."CloseButton"]
+  local resetBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+  resetBtn:SetText("Reset")
+  resetBtn:SetSize(56, 20)
+  resetBtn:SetScale(0.9)
+  resetBtn:ClearAllPoints()
+  if close then
+    resetBtn:SetPoint("RIGHT", close, "LEFT", -6, 0)  -- perfectly aligned beside the X
+  else
+    resetBtn:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -28, -6) -- fallback
+  end
+  resetBtn:SetScript("OnClick", function() ResetRuntimeOrder() end)
+  resetBtn:SetScript("OnEnter", function(selfBtn)
+    GameTooltip:SetOwner(selfBtn, "ANCHOR_LEFT")
+    GameTooltip:SetText("Reset queue order", 1,1,1)
+    GameTooltip:AddLine("Re-sorts ready spells to Tank-first + Priority order.", 0.85,0.85,0.85, true)
+    GameTooltip:Show()
+  end)
+  resetBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+  -- Precreate rows
+  for i=1,MAX_ROWS do
+    local fs=frame:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    fs:SetText(""); fs:Hide()
+    rows[i]=fs
+  end
+
+  frame:SetScript("OnSizeChanged", function() SaveWindow(); Refresh() end)
+  frame:SetScript("OnUpdate", function(_,dt)
+    if not frame:IsShown() then return end
+    ticker=ticker+dt
+    if ticker>=UPDATE_INTERVAL then Refresh(); ticker=0 end
+  end)
+
+  -- ---------- Events ----------
+  local ef=CreateFrame("Frame")
+  ef:RegisterEvent("PLAYER_ENTERING_WORLD")
+  ef:RegisterEvent("GROUP_ROSTER_UPDATE")
+  ef:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+  ef:SetScript("OnEvent", function(_,ev)
+    if ev=="PLAYER_ENTERING_WORLD" or ev=="GROUP_ROSTER_UPDATE" then
+      local oldLC,lastRS = lastCast,readySince
+      RebuildParty()
+      -- carry over known lastCast / readySince where possible
+      for g,sp in pairs(oldLC) do
+        lastCast[g]=lastCast[g] or {}
+        for id,t in pairs(sp) do if not lastCast[g][id] then lastCast[g][id]=t end end
+      end
+      for g,sp in pairs(lastRS or {}) do
+        readySince[g]=readySince[g] or {}
+        for id,t in pairs(sp) do if not readySince[g][id] then readySince[g][id]=t end end
+      end
+      lastAnnouncedTopKey=nil
+      if frame:IsShown() then Refresh() end
+
+    elseif ev=="COMBAT_LOG_EVENT_UNFILTERED" then
+      local _, sub, _, src, _, _, _, _, _, _, _, id = CombatLogGetCurrentEventInfo()
+      if sub=="SPELL_CAST_SUCCESS" and partyByGUID[src] then
+        if spellsByGUID[src] and spellsByGUID[src][id] and DB().enabledSpells[id] then
+          lastCast[src][id]=now()
+          readySince[src]=readySince[src] or {}; readySince[src][id]=nil
+          lastAnnouncedTopKey=nil -- allow re-announce next top
+          if frame:IsShown() then Refresh() end
+        end
+      end
+    end
+  end)
+
+  -- ---------- Public API ----------
+  function GroupCCRuntime_Toggle()
+    EnsureDefaults()
+    if frame:IsShown() then
+      frame:Hide()
+    else
+      RestoreWindow()
+      BuildPriorityIndex(); BuildEntries(); Paint()
+      frame:Show()
+    end
+  end
+
+  -- /gccnow: announce the true global next (entries[1])
+  function GroupCCRuntime_AnnounceNow()
+    EnsureDefaults(); BuildPriorityIndex(); BuildEntries()
+    local e=entries[1]
+    if not e then
+      print("|cff33ff99GroupCC|r: No AoE CC in queue.")
+      return
+    end
+    local line = "Use "..SpellName(e.spellID).." now"
+    if C_VoiceChat and C_VoiceChat.SpeakText then
+      C_VoiceChat.SpeakText(0, line, Enum.VoiceTtsDestination.LocalPlayback, 0, 100)
+    else
+      print("|cff33ff99GroupCC|r:", line)
+    end
+  end
+
+  -- Debug helper for /gcc status
+  function GroupCCRuntime_DebugTop()
+    BuildPriorityIndex(); BuildEntries()
+    local e=entries[1]
+    if e then
+      print(("Top: %s - %s (%.1fs)"):format(e.name, SpellName(e.spellID), e.readyIn))
+    else
+      print("Top: (none)")
+    end
+  end
+
+  function GroupCCRuntime_ForceRefresh()
+    EnsureDefaults(); RebuildParty(); Refresh()
+  end
+
+  -- ---------- Background TTS ticker (runs even if the window is hidden) ----------
+  if C_Timer and C_Timer.NewTicker then
+    C_Timer.NewTicker(0.4, function()
+      pcall(function()
+        BuildPriorityIndex()
+        BuildEntries()
+        AutoTTS()
+      end)
+    end)
+  end
+end
+
+-- Protected init
+local ok,err=pcall(Init)
+if not ok then
+  GroupCC_LastError=err
+  safeErr(err)
+else
+  GroupCCRuntime_InitDone=true
+  print("|cff33ff99GroupCC|r: runtime loaded.")
+end

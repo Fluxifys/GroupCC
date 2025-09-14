@@ -1,0 +1,9 @@
+## Interface: 110200
+## Title: GroupCC
+## Notes: Tracks your party’s AoE crowd-control cooldowns.
+## Author: Fluxifys
+## SavedVariables: GroupCCDB
+
+GroupCC.lua
+GroupCCRuntime.lua
+GroupCCOptions.lua
