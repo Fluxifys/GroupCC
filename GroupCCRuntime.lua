@@ -1,6 +1,6 @@
 -- GroupCCRuntime.lua
--- Queue, role-priority sorting, TTS, resizable window, background auto-TTS
--- Adds: receiving sync with CONFIRM POPUP, and broadcasted /gccnext calls.
+-- Combat-safe: delays sync popups until out of combat; minimizes layout churn during combat.
+-- Shows ALL enabled AoE-CC spells with clipped rows, smooth countdown, FIFO ready order.
 
 GroupCC_LastError = nil
 GroupCCRuntime_InitDone = false
@@ -15,21 +15,28 @@ local function Init()
 
   -- ---------- State ----------
   local frame
-  local rows = {}
   local MAX_ROWS = 24
   local LINE_H  = 18
-  local TOP_PAD = 30
-  local LEFT_PAD = 12
+  local TOP_PAD = 26
+  local LEFT_PAD = 10
 
   local partyByGUID, classByGUID = {}, {}
   local spellsByGUID, lastCast   = {}, {}
-  local readySince               = {}   -- readySince[guid][spellID] = time when it hit 0s
+  local readySince               = {}
   local entries, priorityIndex   = {}, {}
   local lastAnnouncedTopKey      = nil
-  local ticker, UPDATE_INTERVAL  = 0, 0.2
 
-  -- Pending sync for confirm dialog
-  local pendingRole, pendingSpell, pendingSender
+  local accum, UPDATE_INTERVAL = 0, 0.2
+  local ROWS = {}
+  local lastLaidOutWidth = 0  -- to avoid re-anchoring rows every frame
+
+  -- Queue for combat-delayed popups
+  local pendingSyncs = {}  -- array of {kind=..., payload=..., sender=...}
+
+  -- Register addon prefix (needed for Send/Receive)
+  if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
+    C_ChatInfo.RegisterAddonMessagePrefix(ADDON_PREFIX)
+  end
 
   -- ---------- Helpers ----------
   local function now() return GetTime() end
@@ -39,19 +46,13 @@ local function Init()
       local info = C_Spell.GetSpellInfo(id)
       if info and info.name then return info.name end
     end
-    if _G.GetSpellInfo then
-      local n = _G.GetSpellInfo(id)
-      if n then return n end
-    end
-    return "Spell "..id
+    local n = _G.GetSpellInfo and _G.GetSpellInfo(id)
+    return n or ("Spell "..id)
   end
 
   local function BaseCD(id)
-    if _G.GetSpellBaseCooldown then
-      local ms=_G.GetSpellBaseCooldown(id)
-      if ms and ms>0 then return ms/1000 end
-    end
-    return 0
+    local ms = _G.GetSpellBaseCooldown and _G.GetSpellBaseCooldown(id)
+    return (ms and ms>0) and (ms/1000) or 0
   end
 
   local function ColorName(name, cls)
@@ -59,7 +60,6 @@ local function Init()
     return c and ("|cff%02x%02x%02x%s|r"):format(c.r*255,c.g*255,c.b*255,name) or name
   end
 
-  -- Role weight from DB().roleOrder (index = priority)
   local function RoleWeight(unit)
     local order = DB().roleOrder or {"TANK","HEALER","DAMAGER"}
     local map = {}; for i,role in ipairs(order) do map[role]=i end
@@ -92,12 +92,9 @@ local function Init()
   end
   EnsureDefaults()
 
-  -- ---------- Priority ----------
+  -- ---------- Priority index ----------
   local function BuildPriorityIndex()
-    wipe(priorityIndex)
-    for i,id in ipairs(DB().priorityOrder) do
-      priorityIndex[id]=i
-    end
+    wipe(priorityIndex); for i,id in ipairs(DB().priorityOrder) do priorityIndex[id]=i end
   end
 
   -- ---------- Party scan ----------
@@ -121,33 +118,22 @@ local function Init()
   local function RebuildParty()
     wipe(partyByGUID); wipe(classByGUID); wipe(spellsByGUID)
     local me=UnitGUID("player")
-    if me then
-      local _,cls=UnitClass("player")
-      partyByGUID[me]="player"; classByGUID[me]=cls; Seed(me,cls)
-    end
+    if me then local _,cls=UnitClass("player"); partyByGUID[me]="player"; classByGUID[me]=cls; Seed(me,cls) end
     local n=GetNumGroupMembers()
     if n and n>0 then
       if IsInRaid() then
-        for i=1,n do
-          local u="raid"..i
-          if UnitExists(u) then
-            local g=UnitGUID(u)
-            if g then local _,c=UnitClass(u); partyByGUID[g]=u; classByGUID[g]=c; Seed(g,c) end
-          end
+        for i=1,n do local u="raid"..i
+          if UnitExists(u) then local g=UnitGUID(u); if g then local _,c=UnitClass(u); partyByGUID[g]=u; classByGUID[g]=c; Seed(g,c) end end
         end
       else
-        for i=1,GetNumSubgroupMembers() do
-          local u="party"..i
-          if UnitExists(u) then
-            local g=UnitGUID(u)
-            if g then local _,c=UnitClass(u); partyByGUID[g]=u; classByGUID[g]=c; Seed(g,c) end
-          end
+        for i=1,GetNumSubgroupMembers() do local u="party"..i
+          if UnitExists(u) then local g=UnitGUID(u); if g then local _,c=UnitClass(u); partyByGUID[g]=u; classByGUID[g]=c; Seed(g,c) end end
         end
       end
     end
   end
 
-  -- ---------- Entries ----------
+  -- ---------- Build entries (ALL spells) ----------
   local function BuildEntries()
     wipe(entries)
     for guid,pool in pairs(spellsByGUID) do
@@ -161,17 +147,16 @@ local function Init()
             local cd=BaseCD(id)
             local cast=lastCast[guid][id] or (now()-cd)
             local remain=(cast+cd)-now(); if remain<0 then remain=0 end
-
-            readySince[guid]=readySince[guid] or {}
             if remain==0 then
-              if not readySince[guid][id] then readySince[guid][id]=now() end
+              readySince[guid]=readySince[guid] or {}
+              if not readySince[guid][id] then readySince[guid][id]=now() end  -- stamp once at ready
             else
-              readySince[guid][id]=nil
+              if readySince[guid] then readySince[guid][id]=nil end            -- clear while on CD
             end
-
             table.insert(entries,{
               guid=guid, unit=unit, raw=raw, name=name,
-              spellID=id, readyIn=remain, readySince=readySince[guid][id] or math.huge,
+              spellID=id, readyIn=remain,
+              readySince=(readySince[guid] and readySince[guid][id]) or math.huge,
               role=roleW, pri=priorityIndex[id] or 999
             })
           end
@@ -179,39 +164,144 @@ local function Init()
       end
     end
 
+    -- READY: Role -> FIFO(readySince) -> Priority -> Name -> spellID
+    -- CD   : time remaining -> Role -> Priority -> Name -> spellID
     table.sort(entries,function(a,b)
       local aReady, bReady = (a.readyIn==0), (b.readyIn==0)
       if aReady and bReady then
-        if a.role~=b.role             then return a.role < b.role end      -- Role order
-        if a.readySince~=b.readySince then return a.readySince < b.readySince end -- FIFO ready within role
-        if a.pri~=b.pri               then return a.pri < b.pri end        -- Manual spell priority
-        return a.raw < b.raw
+        if a.role       ~= b.role        then return a.role       < b.role       end
+        if a.readySince ~= b.readySince  then return a.readySince < b.readySince end
+        if a.pri        ~= b.pri         then return a.pri        < b.pri        end
+        if a.raw        ~= b.raw         then return a.raw        < b.raw        end
+        return a.spellID < b.spellID
       end
-      if a.readyIn~=b.readyIn         then return a.readyIn < b.readyIn end
-      if a.role~=b.role               then return a.role < b.role end
-      if a.pri~=b.pri                 then return a.pri < b.pri end
-      return a.raw < b.raw
+      if aReady ~= bReady then return aReady end
+      if a.readyIn   ~= b.readyIn   then return a.readyIn   < b.readyIn   end
+      if a.role      ~= b.role      then return a.role      < b.role      end
+      if a.pri       ~= b.pri       then return a.pri       < b.pri       end
+      if a.raw       ~= b.raw       then return a.raw       < b.raw       end
+      return a.spellID < b.spellID
     end)
   end
 
-  -- ---------- UI paint ----------
-  local function Paint()
-    local usableW = math.max(50, frame:GetWidth() - LEFT_PAD*2)
-    for i=1,MAX_ROWS do
-      local r=rows[i]
-      r:ClearAllPoints()
-      r:SetPoint("TOPLEFT", frame, "TOPLEFT", LEFT_PAD, -TOP_PAD - (i-1)*LINE_H)
-      r:SetWidth(usableW); r:SetHeight(LINE_H)
-      r:SetJustifyH("LEFT"); r:SetJustifyV("TOP")
-      if r.SetWordWrap then r:SetWordWrap(false) end
-      if r.SetNonSpaceWrap then r:SetNonSpaceWrap(false) end
-      r:Hide(); r:SetText("")
+  -- ---------- UI ----------
+  frame=CreateFrame("Frame","GroupCCRuntimeFrame",UIParent,"BasicFrameTemplateWithInset")
+  frame:SetResizable(true)
+  if frame.SetResizeBounds then frame:SetResizeBounds(260,160) elseif frame.SetMinResize then frame:SetMinResize(260,160) end
+  frame:SetSize(360,260)
+  frame:SetPoint("CENTER")
+  frame:SetClipsChildren(true)
+  frame:Hide()
+  frame:EnableMouse(true)
+  frame:SetMovable(true)
+  frame:RegisterForDrag("LeftButton")
+  frame:SetScript("OnDragStart", frame.StartMoving)
+  frame:SetScript("OnDragStop",  function(self)
+    self:StopMovingOrSizing()
+    local db=DB(); local p,_,r,x,y=self:GetPoint(1)
+    db.window.w, db.window.h = self:GetWidth(), self:GetHeight()
+    db.window.scale = self:GetScale()
+    db.window.point, db.window.rel, db.window.x, db.window.y = p, r, x, y
+  end)
+
+  local sizer=CreateFrame("Frame", nil, frame)
+  sizer:SetSize(18,18); sizer:SetPoint("BOTTOMRIGHT"); sizer:EnableMouse(true)
+  sizer:SetScript("OnMouseDown", function() frame:StartSizing("BOTTOMRIGHT") end)
+  sizer:SetScript("OnMouseUp",   function()
+    frame:StopMovingOrSizing()
+    local db=DB(); local p,_,r,x,y=frame:GetPoint(1)
+    db.window.w, db.window.h = frame:GetWidth(), frame:GetHeight()
+    db.window.point, db.window.rel, db.window.x, db.window.y = p, r, x, y
+    lastLaidOutWidth = 0 -- force a reflow next paint
+  end)
+  local tex=sizer:CreateTexture(nil,"OVERLAY"); tex:SetAllPoints(); tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
+
+  frame.title=frame:CreateFontString(nil,"OVERLAY","GameFontHighlight")
+  frame.title:SetPoint("TOP",0,-5); frame.title:SetText("GroupCC")
+
+  -- Reset button
+  local close = _G[frame:GetName().."CloseButton"]
+  local resetBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+  resetBtn:SetText("Reset")
+  resetBtn:SetSize(56, 20)
+  resetBtn:SetScale(0.9)
+  if close then resetBtn:SetPoint("RIGHT", close, "LEFT", -6, 0)
+  else resetBtn:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -28, -6) end
+  local function ResetRuntimeOrder()
+    local t = now()
+    for guid,pool in pairs(spellsByGUID) do
+      readySince[guid] = readySince[guid] or {}
+      for id in pairs(pool) do
+        local cd=BaseCD(id); local cast=lastCast[guid][id] or (t-cd)
+        local rem=(cast+cd)-t
+        if rem<=0 then readySince[guid][id]=t end
+      end
     end
+    lastAnnouncedTopKey=nil
+    BuildPriorityIndex(); BuildEntries();
+  end
+  _G.GroupCCRuntime_ResetOrder = ResetRuntimeOrder
+  resetBtn:SetScript("OnClick", ResetRuntimeOrder)
+
+  resetBtn:SetScript("OnEnter", function(selfBtn)
+    GameTooltip:SetOwner(selfBtn, "ANCHOR_LEFT")
+    GameTooltip:SetText("Reset queue order", 1,1,1)
+    GameTooltip:AddLine("Ready spells fall back to Role -> FIFO -> Priority -> Name.", 0.85,0.85,0.85, true)
+    GameTooltip:Show()
+  end)
+  resetBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+  -- Row containers that clip overflow (created once)
+  for i=1,MAX_ROWS do
+    local row = CreateFrame("Frame", nil, frame)
+    row:SetSize(1, LINE_H)
+    row:SetClipsChildren(true)
+
+    local fs = row:CreateFontString(nil,"OVERLAY","GameFontNormal")
+    fs:SetPoint("LEFT", row, "LEFT", 0, 0)
+    fs:SetPoint("RIGHT", row, "RIGHT", 0, 0)
+    fs:SetJustifyH("LEFT"); fs:SetJustifyV("TOP")
+    if fs.SetWordWrap     then fs:SetWordWrap(false) end
+    if fs.SetNonSpaceWrap then fs:SetNonSpaceWrap(false) end
+    fs:SetText(""); row:Hide()
+
+    row.fs = fs
+    ROWS[i] = row
+  end
+
+  local function RestoreWindow()
+    local w=DB().window
+    frame:SetSize(w.w or 360, w.h or 260)
+    frame:SetScale(w.scale or 1)
+    frame:ClearAllPoints()
+    frame:SetPoint(w.point or "CENTER", UIParent, w.rel or "CENTER", w.x or 0, w.y or 0)
+    lastLaidOutWidth = 0 -- force reflow on first paint
+  end
+
+  -- Only reflow rows if width changed
+  local function LayoutIfNeeded()
+    local innerW = math.max(60, frame:GetWidth() - LEFT_PAD*2)
+    if math.abs(innerW - lastLaidOutWidth) < 0.5 then return innerW end
+    for i=1,MAX_ROWS do
+      local row = ROWS[i]
+      row:ClearAllPoints()
+      row:SetPoint("TOPLEFT", frame, "TOPLEFT", LEFT_PAD, -TOP_PAD - (i-1)*LINE_H)
+      row:SetSize(innerW, LINE_H)
+    end
+    lastLaidOutWidth = innerW
+    return innerW
+  end
+
+  -- ---------- Paint (clips long text) ----------
+  local function Paint()
+    local _ = LayoutIfNeeded()
+    for i=1,MAX_ROWS do ROWS[i].fs:SetText(""); ROWS[i]:Hide() end
     local visible = math.min(#entries, MAX_ROWS)
     for i=1,visible do
-      local e=entries[i]; local r=rows[i]
-      r:SetText(("%s - %s (%.1fs)"):format(e.name, SpellName(e.spellID), e.readyIn))
-      r:Show()
+      local e   = entries[i]
+      local row = ROWS[i]
+      row.fs:SetText(("%s - %s (%.1fs)"):format(e.name, SpellName(e.spellID), e.readyIn))
+      row:Show()
     end
   end
 
@@ -238,100 +328,7 @@ local function Init()
     AutoTTS()
   end
 
-  -- ---------- Reset runtime order ----------
-  local function ResetRuntimeOrder()
-    for guid, pool in pairs(spellsByGUID) do
-      readySince[guid] = readySince[guid] or {}
-      for spellID in pairs(pool) do
-        local cd   = BaseCD(spellID)
-        local cast = lastCast[guid][spellID] or (now() - cd)
-        local rem  = (cast + cd) - now()
-        if rem <= 0 then
-          readySince[guid][spellID] = now()
-        end
-      end
-    end
-    lastAnnouncedTopKey = nil
-    Refresh()
-  end
-
-  -- ---------- Window save/restore ----------
-  local function SaveWindow()
-    local db=DB(); local p,_,r,x,y=frame:GetPoint(1)
-    db.window.w, db.window.h = frame:GetWidth(), frame:GetHeight()
-    db.window.scale = frame:GetScale()
-    db.window.point, db.window.rel, db.window.x, db.window.y = p, r, x, y
-  end
-
-  local function RestoreWindow()
-    local w=DB().window
-    frame:SetSize(w.w or 360, w.h or 260)
-    frame:SetScale(w.scale or 1)
-    frame:ClearAllPoints()
-    frame:SetPoint(w.point or "CENTER", UIParent, w.rel or "CENTER", w.x or 0, w.y or 0)
-  end
-
-  -- ---------- UI ----------
-  frame=CreateFrame("Frame","GroupCCRuntimeFrame",UIParent,"BasicFrameTemplateWithInset")
-  frame:SetResizable(true)
-  if frame.SetResizeBounds then frame:SetResizeBounds(240,140) elseif frame.SetMinResize then frame:SetMinResize(240,140) end
-  frame:SetSize(360,260)
-  frame:SetPoint("CENTER")
-  frame:Hide()
-  frame:EnableMouse(true)
-  frame:SetMovable(true)
-  frame:RegisterForDrag("LeftButton")
-  frame:SetScript("OnDragStart", frame.StartMoving)
-  frame:SetScript("OnDragStop",  function(self) self:StopMovingOrSizing(); SaveWindow() end)
-
-  -- sizer
-  local sizer=CreateFrame("Frame", nil, frame)
-  sizer:SetSize(18,18)
-  sizer:SetPoint("BOTTOMRIGHT")
-  sizer:EnableMouse(true)
-  sizer:SetScript("OnMouseDown", function() frame:StartSizing("BOTTOMRIGHT") end)
-  sizer:SetScript("OnMouseUp",   function() frame:StopMovingOrSizing(); SaveWindow() end)
-  local tex=sizer:CreateTexture(nil,"OVERLAY"); tex:SetAllPoints(); tex:SetTexture("Interface\\ChatFrame\\UI-ChatIM-SizeGrabber-Up")
-
-  frame.title=frame:CreateFontString(nil,"OVERLAY","GameFontHighlight")
-  frame.title:SetPoint("TOP",0,-5); frame.title:SetText("GroupCC")
-
-  -- Reset button aligned with Close "X"
-  local close = _G[frame:GetName().."CloseButton"]
-  local resetBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-  resetBtn:SetText("Reset")
-  resetBtn:SetSize(56, 20)
-  resetBtn:SetScale(0.9)
-  resetBtn:ClearAllPoints()
-  if close then
-    resetBtn:SetPoint("RIGHT", close, "LEFT", -6, 0)
-  else
-    resetBtn:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -28, -6)
-  end
-  resetBtn:SetScript("OnClick", function() ResetRuntimeOrder() end)
-  resetBtn:SetScript("OnEnter", function(selfBtn)
-    GameTooltip:SetOwner(selfBtn, "ANCHOR_LEFT")
-    GameTooltip:SetText("Reset queue order", 1,1,1)
-    GameTooltip:AddLine("Re-sorts ready spells by Role → Spell priority → Name.", 0.85,0.85,0.85, true)
-    GameTooltip:Show()
-  end)
-  resetBtn:SetScript("OnLeave", function() GameTooltip:Hide() end)
-
-  -- rows
-  for i=1,MAX_ROWS do
-    local fs=frame:CreateFontString(nil,"OVERLAY","GameFontNormal")
-    fs:SetText(""); fs:Hide()
-    rows[i]=fs
-  end
-
-  frame:SetScript("OnSizeChanged", function() SaveWindow(); Refresh() end)
-  frame:SetScript("OnUpdate", function(_,dt)
-    if not frame:IsShown() then return end
-    ticker=ticker+dt
-    if ticker>=UPDATE_INTERVAL then Refresh(); ticker=0 end
-  end)
-
-  -- ---------- Confirm popup for incoming sync ----------
+  -- ---------- Sync receive + (combat-delayed) popups ----------
   StaticPopupDialogs = StaticPopupDialogs or {}
   StaticPopupDialogs["GROUPCC_ACCEPT_SYNC"] = {
     text = "GroupCC: %s wants to update your settings.\n\nApply %s?",
@@ -342,44 +339,70 @@ local function Init()
         DB().roleOrder = data.payload
       elseif data and data.kind=="SPELL" and data.payload then
         DB().priorityOrder = data.payload
+      elseif data and data.kind=="ENBL" and data.payload then
+        DB().enabledSpells = {}; for _,id in ipairs(data.payload) do DB().enabledSpells[id]=true end
       end
       if GroupCCRuntime_ForceRefresh then GroupCCRuntime_ForceRefresh() end
+      if GroupCCRuntime_ResetOrder  then GroupCCRuntime_ResetOrder()  end
       print("|cff33ff99GroupCC|r: Update applied.")
     end,
-    timeout = 10,
-    whileDead = 1,
-    hideOnEscape = 1,
-    preferredIndex = 3,
+    timeout = 10, whileDead = 1, hideOnEscape = 1, preferredIndex = 3,
   }
 
-  local function showConfirm(kind, sender, payload)
-    local human = (kind=="ROLE") and "role priority" or "spell priority"
-    local data = { kind = kind, payload = payload }
-    StaticPopup_Show("GROUPCC_ACCEPT_SYNC", sender or "someone", human, data)
+  local function queueOrShow(kind, sender, payload)
+    if InCombatLockdown() then
+      table.insert(pendingSyncs, {kind=kind, sender=sender, payload=payload})
+      print("|cff33ff99GroupCC|r: Received "..kind.." update from "..(sender or "someone")..". Will prompt after combat.")
+    else
+      local human = (kind=="ROLE") and "role priority" or (kind=="ENBL" and "enabled spells") or "spell priority"
+      local data = { kind = kind, payload = payload }
+      StaticPopup_Show("GROUPCC_ACCEPT_SYNC", sender or "someone", human, data)
+    end
   end
 
-  -- ---------- Events ----------
   local ef=CreateFrame("Frame")
   ef:RegisterEvent("PLAYER_ENTERING_WORLD")
   ef:RegisterEvent("GROUP_ROSTER_UPDATE")
   ef:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
   ef:RegisterEvent("CHAT_MSG_ADDON")
+  ef:RegisterEvent("PLAYER_REGEN_ENABLED") -- out of combat
+  ef:RegisterEvent("CHALLENGE_MODE_START")
+  ef:RegisterEvent("ZONE_CHANGED_NEW_AREA")
   ef:SetScript("OnEvent", function(_,ev, ...)
     if ev=="PLAYER_ENTERING_WORLD" or ev=="GROUP_ROSTER_UPDATE" then
       local oldLC,lastRS = lastCast,readySince
       RebuildParty()
-      for g,sp in pairs(oldLC) do lastCast[g]=lastCast[g] or {}; for id,t in pairs(sp) do if not lastCast[g][id] then lastCast[g][id]=t end end end
-      for g,sp in pairs(lastRS or {}) do readySince[g]=readySince[g] or {}; for id,t in pairs(sp) do if not readySince[g][id] then readySince[g][id]=t end end end
-      lastAnnouncedTopKey=nil
+      for g,sp in pairs(oldLC) do
+        lastCast[g] = lastCast[g] or {}
+        for id,t in pairs(sp) do
+          if not lastCast[g][id] then lastCast[g][id] = t end
+        end
+      end
+      for g,sp in pairs(lastRS or {}) do
+        readySince[g] = readySince[g] or {}
+        for id,t in pairs(sp) do
+          if not readySince[g][id] then readySince[g][id] = t end
+        end
+      end
+      lastAnnouncedTopKey = nil
       if frame:IsShown() then Refresh() end
+
+    -- auto-reset rotation when a dungeon starts or you zone into one
+    elseif ev=="CHALLENGE_MODE_START" or ev=="ZONE_CHANGED_NEW_AREA" then
+    local inInstance, instanceType = IsInInstance()
+    if inInstance and (instanceType=="party" or instanceType=="scenario") then
+        ResetRuntimeOrder()
+        print("|cff33ff99GroupCC|r: Rotation reset for new dungeon run.")
+    end
 
     elseif ev=="COMBAT_LOG_EVENT_UNFILTERED" then
       local _, sub, _, src, _, _, _, _, _, _, _, id = CombatLogGetCurrentEventInfo()
       if sub=="SPELL_CAST_SUCCESS" and partyByGUID[src] then
         if spellsByGUID[src] and spellsByGUID[src][id] and DB().enabledSpells[id] then
-          lastCast[src][id]=now()
-          readySince[src]=readySince[src] or {}; readySince[src][id]=nil
-          lastAnnouncedTopKey=nil
+          lastCast[src][id] = now()
+          readySince[src]   = readySince[src] or {}
+          readySince[src][id] = nil
+          lastAnnouncedTopKey = nil
           if frame:IsShown() then Refresh() end
         end
       end
@@ -389,10 +412,6 @@ local function Init()
       if prefix ~= ADDON_PREFIX then return end
       if not UnitInParty(sender) and not UnitInRaid(sender) then return end
 
-      -- Expect:
-      --  "V1|ROLE|TANK,HEALER,DAMAGER"
-      --  "V1|SPELL|46968,115750,..."
-      --  "V1|CALL|NOW|spellID|guid"
       local ver, kind, rest = string.match(text, "^([^|]+)|([^|]+)|(.+)$")
       if ver ~= "V1" or not kind then return end
 
@@ -402,16 +421,17 @@ local function Init()
           role = string.upper((role or ""):match("^%s*(.-)%s*$"))
           if role=="TANK" or role=="HEALER" or role=="DAMAGER" then table.insert(order, role) end
         end
-        if #order==3 then
-          showConfirm("ROLE", sender, order)
-        end
+        if #order==3 then queueOrShow("ROLE", sender, order) end
 
       elseif kind == "SPELL" then
         local newOrder = {}
         for id in string.gmatch(rest, "%d+") do table.insert(newOrder, tonumber(id)) end
-        if #newOrder > 0 then
-          showConfirm("SPELL", sender, newOrder)
-        end
+        if #newOrder > 0 then queueOrShow("SPELL", sender, newOrder) end
+
+      elseif kind == "ENBL" then
+        local enabledList = {}
+        for id in string.gmatch(rest, "%d+") do table.insert(enabledList, tonumber(id)) end
+        queueOrShow("ENBL", sender, enabledList)
 
       elseif kind == "CALL" then
         local callType, a, b = rest:match("^([^|]+)|([^|]+)|([^|]+)$")
@@ -434,8 +454,7 @@ local function Init()
   -- ---------- Public API ----------
   function GroupCCRuntime_Toggle()
     EnsureDefaults()
-    if frame:IsShown() then
-      frame:Hide()
+    if frame:IsShown() then frame:Hide()
     else
       RestoreWindow()
       BuildPriorityIndex(); BuildEntries(); Paint()
@@ -443,14 +462,10 @@ local function Init()
     end
   end
 
-  -- Local-only TTS: announce the true global next on your client
   function GroupCCRuntime_AnnounceNow()
     EnsureDefaults(); BuildPriorityIndex(); BuildEntries()
     local e=entries[1]
-    if not e then
-      print("|cff33ff99GroupCC|r: No AoE CC in queue.")
-      return
-    end
+    if not e then print("|cff33ff99GroupCC|r: No AoE CC in queue."); return end
     local line = "Use "..SpellName(e.spellID).." now"
     if C_VoiceChat and C_VoiceChat.SpeakText then
       C_VoiceChat.SpeakText(0, line, Enum.VoiceTtsDestination.LocalPlayback, 0, 100)
@@ -459,19 +474,11 @@ local function Init()
     end
   end
 
-  -- Broadcast to party/raid: pick the top entry and send a targeted "NOW" call
   function GroupCCRuntime_CallNext(broadcast)
     EnsureDefaults(); BuildPriorityIndex(); BuildEntries()
     local e=entries[1]
-    if not e then
-      print("|cff33ff99GroupCC|r: No AoE CC in queue.")
-      return
-    end
-    if not broadcast then
-      -- local behavior fallback
-      GroupCCRuntime_AnnounceNow()
-      return
-    end
+    if not e then print("|cff33ff99GroupCC|r: No AoE CC in queue."); return end
+    if not broadcast then GroupCCRuntime_AnnounceNow(); return end
     local chan = IsInRaid() and "RAID" or (IsInGroup() and "PARTY" or nil)
     if not chan then print("|cff33ff99GroupCC|r: Not in a group.") return end
     local payload = ("V1|CALL|NOW|%d|%s"):format(e.spellID, e.guid)
@@ -482,35 +489,36 @@ local function Init()
   function GroupCCRuntime_DebugTop()
     BuildPriorityIndex(); BuildEntries()
     local e=entries[1]
-    if e then
-      print(("Top: %s - %s (%.1fs)"):format(e.name, SpellName(e.spellID), e.readyIn))
-    else
-      print("Top: (none)")
+    if e then print(("Top: %s - %s (%.1fs)"):format(e.name, SpellName(e.spellID), e.readyIn))
+    else print("Top: (none)") end
+  end
+
+  function GroupCCRuntime_ForceRefresh() EnsureDefaults(); RebuildParty(); Refresh() end
+
+  -- Smooth ticker while window is shown
+  frame:SetScript("OnUpdate", function(_, dt)
+    if not frame:IsShown() then return end
+    accum = accum + dt
+    if accum >= UPDATE_INTERVAL then
+      Refresh()
+      accum = 0
     end
-  end
+  end)
 
-  function GroupCCRuntime_ForceRefresh()
-    EnsureDefaults(); RebuildParty(); Refresh()
-  end
-
-  -- Background TTS ticker
+  -- Background TTS when hidden
   if C_Timer and C_Timer.NewTicker then
-    C_Timer.NewTicker(0.4, function()
+    C_Timer.NewTicker(0.5, function()
       pcall(function()
-        BuildPriorityIndex()
-        BuildEntries()
-        AutoTTS()
+        if not frame:IsShown() then
+          BuildPriorityIndex()
+          BuildEntries()
+          AutoTTS()
+        end
       end)
     end)
   end
 end
 
--- Protected init
 local ok,err=pcall(Init)
-if not ok then
-  GroupCC_LastError=err
-  safeErr(err)
-else
-  GroupCCRuntime_InitDone=true
-  print("|cff33ff99GroupCC|r: runtime loaded.")
-end
+if not ok then GroupCC_LastError=err; safeErr(err)
+else GroupCCRuntime_InitDone=true; print("|cff33ff99GroupCC|r: runtime loaded.") end
